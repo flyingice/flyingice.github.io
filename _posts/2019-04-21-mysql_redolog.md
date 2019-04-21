@@ -1,0 +1,57 @@
+---
+title: MySQL中的redo log，binlog和change buffer
+tag: mysql
+---
+
+关键词：redo log，binlog， change buffer，WAL，checkpoint， 2PC
+
+网上有很多讲WAL机制的文章，介绍MySQL如何通过日志来保证在故障场景下的数据完整性的。简单来说，数据库在写入数据之前会先记录修改日志，然后崩溃重启时能够通过日志来重建数据。这个表述非常笼统，表现在 a）这里的日志到底指什么，redo log还是binlog，还是两者都有？b）既然能够通过日志来重建数据，当数据库崩溃时它就一定存在于磁盘上。那么，事务日志任意时刻都在磁盘上吗？c）故障场景下数据库真的能保证数据零丢失？这些问题涉及到MySQL实现中的一些细节，下面一一讨论。
+
+以下篇幅不再赘述WAL，redo log及其checkpoint机制，binlog等概念本身。
+
+先简单回顾下2PC流程。当前session设置成autocommit=1的情况下，单条更新语句作为事务自动提交的过程如下：a）内存中应用修改；b）写入redo log，redo log处于prepare状态；c）写入binlog；d）redo log变为commit状态，事务提交成功。
+
+需要注意的是，该流程仅仅描述了事务执行commit语句时的中间状态。大多数事务内会包含多条更新语句，每条更新都会在redo log中有对应的记录，那么对于正在执行还未最后提交的事务，其对应的redo log是什么状态呢？这里涉及到另一个问题，上述过程中的"写入"到底是写入内存还是磁盘？其实两者都是有可能的，取决于[innodb_flush_log_at_trx_commit](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit)和[sync_binlog](https://dev.mysql.com/doc/refman/5.7/en/replication-options-binary-log.html#sysvar_sync_binlog)的具体设置，两个参数分别控制了redo log和binlog的落盘时机。
+
+1）innodb_flush_log_at_trx_commit = 1并且sync_binlog = 1
+
+这是系统默认也是最为简单的情形，即事务**提交时**强制fsync落盘log。但是这里的落盘只是提交时落盘，如若一个事务内多条语句，执行期间每条更新对应的redo log只写入了内存中的redo log buffer，buffer中的redo log在事务commit的时候才会多条一起写盘。
+
+为什么未提交的事务的redo log不需要写盘呢？因为没有必要。假设事务执行过程中数据库挂掉，内存中的redo log丢失，重启之后对于数据库来说这个事务好像根本没有存在过一样，这种行为对于业务是无损的，因为事务根本没有提交。
+
+这里又有一个微妙的问题，既然redo log在事务commit的时候才写盘，那么是不是所有已经写盘的redo log都对应了已经提交的事务呢？答案是否。redo log从内存buffer中写入磁盘有三个时机：第一个是本事务commit；第二是后台线程每隔1s异步刷入；第三是在成组提交时和正在commit的并发事务一起写盘。很明显，对于第二和第三两种情况，会出现把未提交事务的redo log写盘的情况。这样做会不会产生问题？假设数据库宕机，重启时该怎么处理未提交事务的redo log？这个问题需要回到开始时描述的2PC流程，redo log是有状态的，事务提交时会先变成prepare状态再变commit状态。一个未提交的事务，中间更新所对应的redo log连prepare状态都不是，于是数据库重启时只要从checkpoint按顺序依次播放redo log，跳过非prepare非commit状态的记录便可恢复宕机前一刻的内存状态。另外要注意的是，崩溃恢复的时候对于prepare状态的redo log是需要特殊处理的，这时候根据redo log的trx id找到对应的binlog，如果binlog完整，即使redo log还处于prepare状态也认为事务提交成功；如果binlog缺失，认定事务提交失败。
+
+和redo log类似，binlog也是有binlog cache的。事务还未提交时记录写入cache，事务提交时完成写盘。与redo log buffer是一块所有事务线程共享的全局内存不同，每个线程都有自己私有的binlog cache，但是binlog文件只有一个。
+
+在参数双1设置下，事务提交时redo log和binlog都必须要落盘。因为有落盘的保证，只要磁盘完好，任何情况下都不会有数据丢失。
+
+2）innodb_flush_log_at_trx_commit = 2或者sync_binlog = N
+
+根据官方文档的说明，事务提交的时候redo log写缓存但并不强制fsync；binlog写到binlog文件中不强制fsync, 但是保证每N个事务fsync一次。初看有点糊涂，这里的缓存和binlog文件是什么东西？实际上redo log和binlog真正写入磁盘前是有两级缓存的，以redo log为例，第一级是redo log buffer，它属于server进程；第二级是文件系统的页面缓存，这是归操作系统内核管理的；最下面一级才是磁盘。
+
+在上述设置下，事务提交时redo log和binlog只保证写入文件系统的页面缓存。相比设置1）中强制fsync写盘，这里commit返回的速度会非常快，log只是从一块内存被复制到了另一块内存，与写盘相比大大提高了IOPS，但是这样系统出现故障的时候会不会产生问题？为了方便说明，这里把故障种类按照严重程度递增顺序分为三级：第一级是数据库server本身挂掉，第二级是操作系统崩溃，第三级是整机故障比如停电。
+
+在innodb_flush_log_at_trx_commit = 2或者sync_binlog = N的时候，如果只发生第一级故障，数据依然会是完整的，因为log记录已经保证在页面缓存中了，只要操作系统能正常运行，刷回磁盘只是时间问题。但如果发生二级甚至三级故障，处于页面缓存但还没来得及fsync的记录将会全部丢失。考虑到redo log有后台线程刷磁盘，binlog每隔N个事务也刷一次磁盘，最坏情况下数据库会丢失最近1s内的redo log和N个事务的binlog。从业务角度来看，就是事务提交成功确认，但是对应的更新却没有反映在数据库中，破坏了事务ACID特性中的持久化要求。1s时间看似很短，但是对于现在动辄上万tps的大型应用来说是无法容忍的。
+
+该参数设置下，redo log和binlog只写入页面缓存，不保证最终落盘，提高了数据库吞吐量但是同时带来了数据丢失风险。
+
+3）innodb_flush_log_at_trx_commit = 0并且sync_binlog = 0
+
+该设置下，事务提交时除了把redo log写入redo log buffer外没有任何保证，对应binlog只调用write写入binlog文件（即操作系统页缓存)，没有fsync。和设置2）类似，在发生第二和第三级故障时数据丢失，且由于binlog不会每N个事务刷一次磁盘，数据丢失量只会更大。比设置2）更危险的是，哪怕只是数据库本身崩溃重启，未落盘的redo log和binlog也会全部丢失。
+
+总结一下上面内容，事务提交时的2PC机制保证了redo log和binlog的一致性。在数据库故障重启的场景下，恢复过程是根据redo log来完成的，换句话说，redo log具备完全的crash-recovery能力。innodb_flush_log_at_trx_commit和sync_binlog这两个参数分别控制了事务提交时redo log和binlog的写盘时机，其具体的设置值决定了redo log和binlog在极端情况下的完整程度。通过调整设置，可以在数据完整性和吞吐量之间作权衡。
+
+由于redo log的存在，数据更新发生时其对应的修改只存在于内存的buffer pool中，磁盘数据并没有变化，也就是说，内存中存放了数据脏页。数据脏页会定期从内存刷回磁盘。但是，刷盘操作和redo log是没有关系的，并不会在redo log中留下记录。容易混淆的原因是redo log的checkpoint在顺序推移的过程中会主动写盘。但是数据脏页刷盘除了checkpoint推进，还会在buffer pool占满需要淘汰数据页以及后台线程定期刷盘的时候进行。那么按照redo log和数据页刷盘过程的设计，可能会出现同一个数据页被多次修改，这些修改均在当前checkpoint之后，而该脏页也还没来得及刷回磁盘的情况。在这种情况下，checkpoint在推进的过程中只需在执行第一个针对该数据页的修改的时候将脏页刷回磁盘即可，后面的记录可以不予理会。这样做的原因是第一次刷回磁盘的脏页已经包含了所有的修改，之后不必重复刷盘，进一步提升了IO效率。
+
+针对非唯一索引的change buffer优化又让redo log机制变得更复杂了些。上一段简单总结了数据脏页如何刷盘，其前提是buffer pool中的数据页已经包含了真实的修改。然而change buffer的引入，会出现内存中数据页完全"干净"的情况。一个基于非唯一索引的修改，真实包含该修改的数据页可能在内存中没有，磁盘上也没有。前面分析了由于有redo log存在，即使内存中的脏页没来得及写盘，在数据库崩溃重启的时候，也不会造成数据丢失。那么加上change buffer后，内存中可能连脏页都不是的情况，数据库是如何故障恢复的呢？
+
+change buffer名字中带buffer，看似是内存中的数据，其实它既在内存中有，同时也会被持久化到磁盘，物理上存在于系统表空间ibdata1中。其中一个原因是内存中的change buffer共享了buffer pool的空间，最大比例可以通过[innodb_change_buffer_max_size](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_change_buffer_max_size)控制。既然有空间限制，那么必然会出现buffer占满的情况，这时候除了持久化到磁盘别无选择；另外一个因素就是故障恢复的需要。
+
+数据库故障的情况下，已经持久化的change buffer自然没有什么问题，内存中那部分的丢失如何处理？又要回到文章开头的2PC机制，a）步骤中先应用修改到内存。这里面包含了两种可能，一是真实修改写到内存，二是能利用change buffer优化的情况下不立即将真实修改应用到内存，而是把修改意图写到change buffer。第一种情况下数据变动会记录到redo log，第二种情况中写change buffer这个动作本身也是会被记录到redo log的，这点非常关键。如果数据库在b）步骤中或者之前挂掉（包括事务正在执行还没commit以及commit时进行到b）步骤），redo log没有记录change buffer中的改动，重启之后这部分数据是会被丢弃的，但是由于事务未成功提交所以业务无损。只要至少c）步骤完成，redo log和binlog一致，事务会被认定执行成功。数据库重启恢复的时候，可以根据崩溃前已经持久化的change buffer和redo log上的内容重建完整的change buffer。
+
+既然change buffer有持久化的需求，那么磁盘上的change buffer会不会无限变大？其实不会，和内存中的change buffer一样，每次目标数据页被读取或者后台线程定期启动将change buffer的内容和目标数据页进行merge的时候，对应的change buffer记录就可以被丢弃了。不过merge的时候，也是需要写redo log的。但凡对数据页进行修改，都必须写redo log，因为只有这样才能保证即使数据库宕机脏页也不丢失。
+
+change buffer中的记录保证把内存中的数据页变成脏页，它的使命就完成了，至于后面的数据脏页刷盘和它通通没关系。但是比较微妙的一点是，change buffer本身从内存到磁盘的持久化过程，和普通数据页共享了同一刷盘机制。
+
+本文理了理在数据库故障重启场景下，redo log，binlog和change buffer如何协同配合来保证数据完整性的。最后回答一下开头的三个问题，a）故障恢复主要依靠redo log；b）事务日志并不一定在磁盘；c）数据零丢失是有前提条件的，取决于参数设置。
+
