@@ -3,9 +3,9 @@ title: InnoDB的自适应刷脏
 tag: mysql
 ---
 
-InnoDB刷脏除了数据库正常关机和系统空闲外还有两个驱动因素：一个是buffer pool空间不够需要从中淘汰数据页，如果被驱逐的页面正好是脏页的话需要先将它刷盘，这种情况对应的是LRU flush；另一个是redo log快要占满，需要推进checkpoint来腾出剩余空间，该情况对应flush list flush。本文只讨论后者的具体实现及影响因素。
+InnoDB刷脏除了数据库正常关机和系统空闲外还有两个驱动因素：一个是buffer pool空间不够需要从中淘汰数据页，如果被驱逐的页面正好是脏页的话需要先将它刷盘，这种情况对应的是LRU flush；另一个是redo log快要占满，需要推进checkpoint来腾出剩余空间，该情况对应flush list flush。本文只讨论后者的具体实现（贴出的代码非完整片段）及影响因素。
 
-系统参数[innodb_io_capacity](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity)在很大程度上决定了刷脏的最大IOPS，但是数据库并不是一直保持这个速率满负荷刷脏的。实际速率主要受两个因素影响，buffer pool中当前的脏页比例以及redo log的年龄，源代码在[buf0flu.cc](https://github.com/flyingice/mysql-server/blob/8.0/storage/innobase/buf/buf0buf.cc)的page_cleaner_flush_pages_recommendation()方法中。后台线程page cleaner是在mysql 5.6中才引入的，之前版本的刷脏操作在用户线程进行。有了page cleaner之后，只有当redo log的年龄超过同步刷脏点的情况下才会在用户线程中完成，这时候所有其它用户线程都会阻塞来等待刷脏的用户线程。
+系统参数[innodb_io_capacity](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity)在很大程度上决定了刷脏的最大IOPS，但是数据库并不是一直保持这个速率满负荷刷脏的。实际速率主要受两个因素影响，buffer pool中当前的脏页比例以及checkpoint年龄，源代码在[buf0flu.cc](https://github.com/flyingice/mysql-server/blob/8.0/storage/innobase/buf/buf0buf.cc)的page_cleaner_flush_pages_recommendation()方法中。后台线程page cleaner是在mysql 5.6中才引入的，之前版本的刷脏操作在用户线程进行。有了page cleaner之后，只有当checkpoint年龄超过同步刷脏点的情况下才会在用户线程中完成，这时候所有其它用户线程都会阻塞来等待刷脏的用户线程。
 
 ```c++
 cur_lsn = log_buffer_dirty_pages_added_up_to_lsn(*log_sys)
@@ -34,7 +34,7 @@ pct_for_lsn = af_get_pct_for_lsn(age);
 pct_total = ut_max(pct_for_dirty, pct_for_lsn)
 ```
 
-这里是决定刷盘速率的核心逻辑。先估算redo log的年龄，取当前写入位置和checkpoint的差值，该年龄在af_get_pct_for_lsn中用到。af_get_pct_for_dirty()和af_get_pct_for_lsn()分别对应了文章开始提到的脏页比例和redo log年龄这两个因素，最后pct_total取较大的那个因子。这里pct_for_dirty的取值是一个[0, 100]的整数，而af_get_pct_for_lsn数值是可能超过100的。为了先理清主线把af_get_pct_for_dirty()和af_get_pct_for_lsn()的实现细节放到最后。
+这里是决定刷盘速率的核心逻辑。af_get_pct_for_dirty()和af_get_pct_for_lsn()分别对应了文章开始提到的脏页比例和checkpoint年龄这两个因素，最后pct_total取较大的那个因子。这里pct_for_dirty的取值是一个[0, 100]的整数，而af_get_pct_for_lsn数值是可能超过100的。为了先理清主线把af_get_pct_for_dirty()和af_get_pct_for_lsn()的实现细节放到最后。
 
 ```c++
 lsn_t target_lsn = oldest_lsn + lsn_avg_rate * buf_flush_lsn_scan_factor;
@@ -103,7 +103,7 @@ buffer_pool_t结构体对应buffer pool的一个实例（buffer pool总大小超
 
 控制脏页比例有两个重要参数[innodb_max_dirty_pages_pct_lwm](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_max_dirty_pages_pct_lwm)和[innodb_max_dirty_pages_pct](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_max_dirty_pages_pct)。前者是脏页比例低水位，后者是高水位。af_get_pct_for_dirty()的实现里先统计buffer pool中的脏页比例，当低水位未设置的时候，脏页比例在小于高水位之前都不会影响刷盘速率；若设置了低水位且脏页比例大于低水位，则返回100 * 脏页比例 / 高水位。
 
-af_get_pct_for_lsn()的计算涉及[innodb_adaptive_flushing](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_adaptive_flushing)，[innodb_adaptive_flushing_lwm](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_adaptive_flushing_lwm)，[innodb_io_capacity](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity)以及[innodb_io_capacity_max](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity_max)四个可调参数和异步刷脏点max_modified_age_async。max_modified_age_async定义在[log0chkp.cc](https://github.com/flyingice/mysql-server/blob/8.0/storage/innobase/log/log0chkp.cc)中，值为redo log总容量的7/8。由于同步刷脏仍然在用户线程进行，所以af_get_pct_for_lsn()的计算并不会受到同步刷脏点max_modified_age_sync的影响。具体计算方法：1）若redo log年龄比自适应刷脏低水位小则返回0，否则下一步；2）年龄小于异步刷脏点且未开启自适应刷脏时返回0，否则下一步；3) 通过如下启发式算法返回影响因子。
+af_get_pct_for_lsn()的计算涉及[innodb_adaptive_flushing](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_adaptive_flushing)，[innodb_adaptive_flushing_lwm](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_adaptive_flushing_lwm)，[innodb_io_capacity](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity)以及[innodb_io_capacity_max](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity_max)四个可调参数和异步刷脏点max_modified_age_async。max_modified_age_async定义在[log0chkp.cc](https://github.com/flyingice/mysql-server/blob/8.0/storage/innobase/log/log0chkp.cc)中，值为redo log总容量的7/8。由于同步刷脏仍然在用户线程进行，所以af_get_pct_for_lsn()的计算并不会受到同步刷脏点max_modified_age_sync的影响。具体计算方法：1）若checkpoint年龄比自适应刷脏低水位小则返回0，否则下一步；2）年龄小于异步刷脏点且未开启自适应刷脏时返回0，否则下一步；3) 通过如下启发式算法返回影响因子。
 
 ```c++
 lsn_age_factor = (age * 100) / limit_for_age;
@@ -114,7 +114,7 @@ return (static_cast<ulint>(((srv_max_io_capacity / srv_io_capacity) *
                             7.5));
 ```
 
-系统参数[innodb_io_capacity](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity)的设置受限于硬盘随机写的IOPS，一般不能随意变大。所以如果想加快flush list flush的速度，可以尝试将[innodb_io_capacity_max](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity_max)的值调高。
+系统参数[innodb_io_capacity](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity)的设置受限于硬盘随机写的IOPS，一般不会随意变动。所以如果想加快flush list flush的速度，可以尝试将[innodb_io_capacity_max](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity_max)的值调高。
 
 参考资料：
 
@@ -126,4 +126,4 @@ return (static_cast<ulint>(((srv_max_io_capacity / srv_io_capacity) *
 
 [4] [Introducing page_cleaner thread in InnoDB](https://web.archive.org/web/20160417094246/https://blogs.oracle.com/mysqlinnodb/entry/introducing_page_cleaner_thread_in)
 
-[5] [数据库内核月报 － 2017 / 05](http://mysql.taobao.org/monthly/2017/05)
+[5] [MySQL · 引擎特性 · InnoDB Buffer Pool](http://mysql.taobao.org/monthly/2017/05/01/)
