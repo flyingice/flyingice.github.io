@@ -93,4 +93,16 @@ P1和P2交替提议无限循环，阻止了对方的请求。
 
 可以借鉴Google Chubby中实现Paxos的方法（参考[Paxos Made Live - An Engineering Perspective](https://www.cs.utexas.edu/users/lorenzo/corsi/cs380d/papers/paper2-1.pdf)）。假设共有n个节点，从0到(n-1)依次编号，那么proposalId=m*n + k （m为本地使用过的最大id，k为节点编号）。这样可以保证每个proposer从互不相交的集合中选取数字，而且本地id自增的步长都是n。
 
-另外也可以像[架构师需要了解的Paxos原理、历程及实战](https://mp.weixin.qq.com/s?__biz=MzAwMDU1MTE1OQ==&mid=403582309&idx=1&sn=80c006f4e84a8af35dc8e9654f018ace&scene=0&key=710a5d99946419d9c39ba913a16ee674c6016edfedfc691aa0df9db57d008419c1a96168b861e0ef8b01d6ec76c7e693&ascene=7&uin=MTc0MDg1&devicetype=android-19&version=26030931&nettype=WIFI&pass_ticket=J96esr4md7XLhmfoelhpNAXq73CErFPyQ5BlGEWTtHg=)介绍的那样，采取高位时间戳低位机器IP的做法。不过文章里说的时间戳应该是指的稳定时钟，普通的unix时间戳是无法保证单调递增的。
+另外也可以像[架构师需要了解的Paxos原理、历程及实战](https://mp.weixin.qq.com/s?__biz=MzAwMDU1MTE1OQ==&mid=403582309&idx=1&sn=80c006f4e84a8af35dc8e9654f018ace&scene=0&key=710a5d99946419d9c39ba913a16ee674c6016edfedfc691aa0df9db57d008419c1a96168b861e0ef8b01d6ec76c7e693&ascene=7&uin=MTc0MDg1&devicetype=android-19&version=26030931&nettype=WIFI&pass_ticket=J96esr4md7XLhmfoelhpNAXq73CErFPyQ5BlGEWTtHg=)介绍的那样，采取高位时间戳低位机器IP的做法。不过文章里说的时间戳应该是指的单调时钟，因为系统的unix时间戳是无法保证单调递增的。实现单调时钟要么直接有标准类库支持（比如C++ 11之后的[steady_clock](https://en.cppreference.com/w/cpp/chrono/steady_clock)）,要么像[Twitter snowflake](https://github.com/twitter-archive/snowflake/releases/tag/snowflake-2010)一样基于普通的系统时钟实现稳定时钟：
+
+```scala
+protected def tilNextMillis(lastTimestamp: Long): Long = {
+    var timestamp = timeGen()
+    while (timestamp <= lastTimestamp) {
+      timestamp = timeGen()
+    }
+    timestamp
+  }
+
+protected def timeGen(): Long = System.currentTimeMillis()
+```
