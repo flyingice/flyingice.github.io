@@ -93,7 +93,7 @@ P1和P2交替提议无限循环，阻止了对方的请求。
 
 可以借鉴Google Chubby中实现Paxos的方法（参考[Paxos Made Live - An Engineering Perspective](https://www.cs.utexas.edu/users/lorenzo/corsi/cs380d/papers/paper2-1.pdf)）。假设共有n个节点，从0到(n-1)依次编号，那么proposalId=m*n + k （m为本地使用过的最大id，k为节点编号）。这样可以保证每个proposer从互不相交的集合中选取数字，而且本地id自增的步长都是n。
 
-另外也可以像[架构师需要了解的Paxos原理、历程及实战](https://mp.weixin.qq.com/s?__biz=MzAwMDU1MTE1OQ==&mid=403582309&idx=1&sn=80c006f4e84a8af35dc8e9654f018ace&scene=0&key=710a5d99946419d9c39ba913a16ee674c6016edfedfc691aa0df9db57d008419c1a96168b861e0ef8b01d6ec76c7e693&ascene=7&uin=MTc0MDg1&devicetype=android-19&version=26030931&nettype=WIFI&pass_ticket=J96esr4md7XLhmfoelhpNAXq73CErFPyQ5BlGEWTtHg=)介绍的那样，采取高位时间戳低位机器IP的做法。不过文章里说的时间戳应该是指的单调时钟，因为系统的unix时间戳是无法保证单调递增的。实现单调时钟要么直接有标准类库支持（比如C++ 11之后的[steady_clock](https://en.cppreference.com/w/cpp/chrono/steady_clock)）,要么像[Twitter snowflake](https://github.com/twitter-archive/snowflake/releases/tag/snowflake-2010)一样基于普通的系统时钟实现稳定时钟：
+另外也可以像[架构师需要了解的Paxos原理、历程及实战](https://mp.weixin.qq.com/s?__biz=MzAwMDU1MTE1OQ==&mid=403582309&idx=1&sn=80c006f4e84a8af35dc8e9654f018ace&scene=0&key=710a5d99946419d9c39ba913a16ee674c6016edfedfc691aa0df9db57d008419c1a96168b861e0ef8b01d6ec76c7e693&ascene=7&uin=MTc0MDg1&devicetype=android-19&version=26030931&nettype=WIFI&pass_ticket=J96esr4md7XLhmfoelhpNAXq73CErFPyQ5BlGEWTtHg=)介绍的那样，采取高位时间戳低位机器IP的做法。不过文章里说的时间戳应该指的是单调时钟，因为系统的unix时间戳是无法保证单调递增的。实现单调时钟要么直接有标准类库支持（比如C++ 11之后的[steady_clock](https://en.cppreference.com/w/cpp/chrono/steady_clock)）,要么像[Twitter snowflake](https://github.com/twitter-archive/snowflake/releases/tag/snowflake-2010)一样基于普通系统时钟来实现稳定时钟：
 
 ```scala
 protected def tilNextMillis(lastTimestamp: Long): Long = {
@@ -106,3 +106,9 @@ protected def tilNextMillis(lastTimestamp: Long): Long = {
 
 protected def timeGen(): Long = System.currentTimeMillis()
 ```
+
+最后留个问题，在Lamport的[个人页面](http://lamport.azurewebsites.net/pubs/pubs.html#paxos-simple)上对于论文[Paxos Made Simple](http://lamport.azurewebsites.net/pubs/paxos-simple.pdf)有这么一段话：
+
+*In 2015, Michael Dearderuff of Amazon informed me that one sentence in this paper is ambiguous, and interpreting it the wrong way leads to an incorrect algorithm.  Dearderuff found that a number of Paxos implementations on Github implemented this incorrect algorithm.  Apparently, the implementors did not bother to read the precise description of the algorithm in [[122]](http://lamport.azurewebsites.net/pubs/pubs.html#lamport-paxos).  I am not going to remove this ambiguity or reveal where it is.  Prose is not the way to precisely describe algorithms.  Do not try to implement the algorithm from this paper.  Use [122] instead.*
+
+有人在[Github](https://github.com/Tencent/phxpaxos/issues/166)上对腾讯开源出来的在微信里应用的Paxos算法实现提出了一样的问题。这里说的歧义在论文的什么地方呢？
