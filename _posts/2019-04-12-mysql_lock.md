@@ -33,7 +33,7 @@ SELECT * FROM t1 WHERE id<=4 FOR UPDATE;
 
 事务1在未提交或回滚的情况下，事务2五种情况下的SELECT语句都会阻塞。下面先以case 2为例，查看事务状态和锁状态：
 
-```shell
+```wiki
 mysql> show engine innodb status;
 ------------
 TRANSACTIONS
