@@ -1,5 +1,6 @@
 ---
 title: std::remove_if的陷阱
+author: Yibin Yang
 tag: c++ STL
 ---
 

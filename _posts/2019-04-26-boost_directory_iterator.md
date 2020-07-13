@@ -1,5 +1,6 @@
 ---
 title: 用boost中directory_iterator遍历目录碰到的问题
+author: Yibin Yang
 tag: c++ boost posix
 ---
 

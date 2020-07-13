@@ -1,5 +1,6 @@
 ---
 title: InnoDB的自适应刷脏
+author: Yibin Yang
 tag: mysql
 ---
 
