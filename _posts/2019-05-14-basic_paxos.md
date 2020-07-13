@@ -1,5 +1,6 @@
 ---
 title: Basic Paxos
+author: Yibin Yang
 tag: distributed-system
 ---
 

@@ -1,5 +1,6 @@
 ---
 title: MySQL中的redo log，binlog和change buffer
+author: Yibin Yang
 tag: mysql
 ---
 

@@ -1,5 +1,6 @@
 ---
 title: 关于InnoDB行锁的一点思考
+author: Yibin Yang
 tag: mysql
 ---
 

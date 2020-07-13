@@ -1,5 +1,6 @@
 ---
 title: macOS X配置X11 forwarding
+author: Yibin Yang
 tag: ssh
 ---
 
